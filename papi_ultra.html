@@ -1,0 +1,215 @@
+import customtkinter as ctk
+import openai
+import threading
+import subprocess
+import os
+import sys
+import json
+from datetime import datetime
+
+# --- Configuration & Styling ---
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+class UltraAI(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        # Window Setup
+        self.title("PAPI Ultra 5.0")
+        self.geometry("900x700")
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        # State
+        self.messages = []
+        self.api_key = ""
+        self.model = "gpt-4o" # Defaults to the smartest available
+        self.load_config()
+
+        # Sidebar (Settings)
+        self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.sidebar.grid_rowconfigure(4, weight=1)
+
+        self.logo_label = ctk.CTkLabel(self.sidebar, text="PAPI ULTRA", font=ctk.CTkFont(size=20, weight="bold"))
+        self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
+
+        self.api_key_entry = ctk.CTkEntry(self.sidebar, placeholder_text="Enter OpenAI API Key", show="*")
+        self.api_key_entry.grid(row=1, column=0, padx=20, pady=10)
+        if self.api_key: self.api_key_entry.insert(0, self.api_key)
+
+        self.save_key_btn = ctk.CTkButton(self.sidebar, text="Save Key", command=self.save_config)
+        self.save_key_btn.grid(row=2, column=0, padx=20, pady=10)
+
+        self.model_select = ctk.CTkOptionMenu(self.sidebar, values=["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"])
+        self.model_select.grid(row=3, column=0, padx=20, pady=10)
+
+        self.clear_chat_btn = ctk.CTkButton(self.sidebar, text="Clear Memory", fg_color="transparent", border_width=2, command=self.clear_chat)
+        self.clear_chat_btn.grid(row=5, column=0, padx=20, pady=20)
+
+        # Main Chat Area
+        self.chat_frame = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.chat_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+
+        # Input Area
+        self.input_frame = ctk.CTkFrame(self)
+        self.input_frame.grid(row=1, column=0, columnspan=2, padx=20, pady=20, sticky="ew")
+        
+        self.input_entry = ctk.CTkEntry(self.input_frame, placeholder_text="Ask PAPI to do anything...", height=50)
+        self.input_entry.pack(side="left", fill="both", expand=True, padx=(10, 10), pady=10)
+        self.input_entry.bind("<Return>", self.send_message_event)
+
+        self.send_btn = ctk.CTkButton(self.input_frame, text="Execute", width=100, height=40, command=self.send_message)
+        self.send_btn.pack(side="right", padx=(0, 10), pady=10)
+
+        # System Prompt for Agent Behavior
+        self.system_prompt = (
+            "You are PAPI Ultra, a highly advanced AI agent. "
+            "You are helpful, concise, and capable. "
+            "CRITICAL: If the user asks you to perform a system action (like creating files, running commands, opening apps), "
+            "you MUST format your response exactly like this: "
+            "COMMAND: <the_command_to_run>"
+            "\nExample: COMMAND: mkdir 'New Project'"
+            "\nDo not wrap the command in markdown blocks. Just the prefix."
+            "\nIf no command is needed, just reply normally."
+        )
+
+        # Welcome Message
+        self.add_message("PAPI", "System Online. Ready for instructions.")
+
+    def load_config(self):
+        """Loads API key from local file."""
+        if os.path.exists("papi_config.json"):
+            try:
+                with open("papi_config.json", "r") as f:
+                    data = json.load(f)
+                    self.api_key = data.get("api_key", "")
+            except:
+                pass
+
+    def save_config(self):
+        """Saves API key locally."""
+        self.api_key = self.api_key_entry.get()
+        with open("papi_config.json", "w") as f:
+            json.dump({"api_key": self.api_key}, f)
+        self.add_message("System", "Configuration saved.")
+
+    def clear_chat(self):
+        self.messages = []
+        for widget in self.chat_frame.winfo_children():
+            widget.destroy()
+        self.add_message("System", "Memory wiped.")
+
+    def send_message_event(self, event):
+        self.send_message()
+
+    def send_message(self):
+        user_input = self.input_entry.get()
+        if not user_input: return
+        
+        self.add_message("You", user_input)
+        self.input_entry.delete(0, "end")
+        self.input_entry.configure(state="disabled") # Lock input while processing
+
+        # Run API call in background thread to keep GUI responsive
+        threading.Thread(target=self.get_ai_response, args=(user_input,)).start()
+
+    def get_ai_response(self, user_text):
+        if not self.api_key:
+            self.add_message("Error", "Please enter your OpenAI API Key in settings.")
+            self.unlock_input()
+            return
+
+        client = openai.OpenAI(api_key=self.api_key)
+        
+        # Prepare history
+        history = [{"role": "system", "content": self.system_prompt}]
+        for msg in self.messages[-10:]: # Keep context short for efficiency
+            history.append(msg)
+        history.append({"role": "user", "content": user_text})
+
+        try:
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=history
+            )
+            ai_text = response.choices[0].message.content
+            
+            # Check for commands
+            if "COMMAND:" in ai_text:
+                parts = ai_text.split("COMMAND:")
+                explanation = parts[0].strip()
+                command = parts[1].strip()
+                
+                if explanation:
+                    self.add_message("PAPI", explanation)
+                
+                # Ask for permission to execute
+                self.request_execution(command)
+            else:
+                self.add_message("PAPI", ai_text)
+
+            self.messages.append({"role": "assistant", "content": ai_text})
+            
+        except Exception as e:
+            self.add_message("Error", str(e))
+        
+        self.unlock_input()
+
+    def request_execution(self, command):
+        """Creates a popup to confirm command execution."""
+        # Use .after to manipulate GUI from the thread
+        self.after(0, lambda: self._show_confirm_dialog(command))
+
+    def _show_confirm_dialog(self, command):
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Authorize Execution")
+        dialog.geometry("400x200")
+        dialog.attributes("-topmost", True)
+        
+        label = ctk.CTkLabel(dialog, text=f"PAPI wants to execute:\n\n{command}\n\nAllow this?", font=("Arial", 14), wraplength=350)
+        label.pack(pady=20)
+        
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=20)
+        
+        yes_btn = ctk.CTkButton(btn_frame, text="EXECUTE", fg_color="red", command=lambda: self.execute_command(command, dialog))
+        yes_btn.pack(side="left", expand=True, padx=10)
+        
+        no_btn = ctk.CTkButton(btn_frame, text="Cancel", command=dialog.destroy)
+        no_btn.pack(side="right", expand=True, padx=10)
+
+    def execute_command(self, cmd, dialog):
+        dialog.destroy()
+        self.add_message("System", f"Executing: {cmd}...")
+        try:
+            # Run command
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            output = result.stdout if result.stdout else result.stderr
+            self.add_message("Terminal", output)
+        except Exception as e:
+            self.add_message("Error", f"Execution failed: {e}")
+
+    def add_message(self, sender, text):
+        # Schedule GUI update on main thread
+        self.after(0, lambda: self._render_message(sender, text))
+
+    def _render_message(self, sender, text):
+        msg_frame = ctk.CTkFrame(self.chat_frame, fg_color=("gray85", "gray25"))
+        msg_frame.pack(fill="x", pady=5, padx=5)
+        
+        sender_lbl = ctk.CTkLabel(msg_frame, text=sender, font=("Arial", 12, "bold"))
+        sender_lbl.pack(anchor="w", padx=10, pady=(5,0))
+        
+        msg_lbl = ctk.CTkLabel(msg_frame, text=text, font=("Arial", 14), wraplength=500, justify="left")
+        msg_lbl.pack(anchor="w", padx=10, pady=(0,5))
+        
+        self.chat_frame._parent_canvas.yview_moveto(1.0)
+
+    def unlock_input(self):
+        self.after(0, lambda: self.input_entry.configure(state="normal"))
+
+if __name__ == "__main__":
+    app = UltraAI()
+    app.mainloop()
